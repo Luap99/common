@@ -162,10 +162,12 @@ github.com/davecgh/go-spew/spew
 # github.com/disiqueira/gotree/v3 v3.0.2
 ## explicit
 github.com/disiqueira/gotree/v3
-# github.com/docker/distribution v2.7.1+incompatible
+# github.com/distribution/reference v0.6.0
+## explicit
+github.com/distribution/reference
+# github.com/docker/distribution v2.8.3+incompatible
 ## explicit
 github.com/docker/distribution
-github.com/docker/distribution/digestset
 github.com/docker/distribution/metrics
 github.com/docker/distribution/reference
 github.com/docker/distribution/registry/api/errcode
@@ -337,6 +339,7 @@ github.com/onsi/gomega/types
 # github.com/opencontainers/go-digest v1.0.0
 ## explicit
 github.com/opencontainers/go-digest
+github.com/opencontainers/go-digest/digestset
 # github.com/opencontainers/image-spec v1.0.2-0.20190823105129-775207bd45b6
 ## explicit
 github.com/opencontainers/image-spec/specs-go
