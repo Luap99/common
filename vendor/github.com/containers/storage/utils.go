@@ -11,19 +11,9 @@ func ParseIDMapping(UIDMapSlice, GIDMapSlice []string, subUIDMap, subGIDMap stri
 	return types.ParseIDMapping(UIDMapSlice, GIDMapSlice, subUIDMap, subGIDMap)
 }
 
-// GetRootlessRuntimeDir returns the runtime directory when running as non root
-func GetRootlessRuntimeDir(rootlessUID int) (string, error) {
-	return types.GetRootlessRuntimeDir(rootlessUID)
-}
-
-// DefaultStoreOptionsAutoDetectUID returns the default storage ops for containers
-func DefaultStoreOptionsAutoDetectUID() (types.StoreOptions, error) {
-	return types.DefaultStoreOptionsAutoDetectUID()
-}
-
-// DefaultStoreOptions returns the default storage ops for containers
-func DefaultStoreOptions(rootless bool, rootlessUID int) (types.StoreOptions, error) {
-	return types.DefaultStoreOptions(rootless, rootlessUID)
+// DefaultStoreOptions returns the default storage options for containers
+func DefaultStoreOptions() (types.StoreOptions, error) {
+	return types.DefaultStoreOptions()
 }
 
 func validateMountOptions(mountOptions []string) error {
@@ -39,4 +29,36 @@ func validateMountOptions(mountOptions []string) error {
 		}
 	}
 	return nil
+}
+
+func applyNameOperation(oldNames []string, opParameters []string, op updateNameOperation) ([]string, error) {
+	var result []string
+	switch op {
+	case setNames:
+		// ignore all old names and just return new names
+		result = opParameters
+	case removeNames:
+		// remove given names from old names
+		result = make([]string, 0, len(oldNames))
+		for _, name := range oldNames {
+			// only keep names in final result which do not intersect with input names
+			// basically `result = oldNames - opParameters`
+			nameShouldBeRemoved := false
+			for _, opName := range opParameters {
+				if name == opName {
+					nameShouldBeRemoved = true
+				}
+			}
+			if !nameShouldBeRemoved {
+				result = append(result, name)
+			}
+		}
+	case addNames:
+		result = make([]string, 0, len(opParameters)+len(oldNames))
+		result = append(result, opParameters...)
+		result = append(result, oldNames...)
+	default:
+		return result, errInvalidUpdateNameOperation
+	}
+	return dedupeStrings(result), nil
 }
