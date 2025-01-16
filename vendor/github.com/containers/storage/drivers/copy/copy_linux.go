@@ -1,4 +1,4 @@
-// +build cgo
+//go:build cgo
 
 package copy
 
@@ -10,12 +10,12 @@ package copy
 #endif
 */
 import "C"
+
 import (
 	"container/list"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +26,6 @@ import (
 	"github.com/containers/storage/pkg/pools"
 	"github.com/containers/storage/pkg/system"
 	"github.com/containers/storage/pkg/unshare"
-	rsystem "github.com/opencontainers/runc/libcontainer/system"
 	"golang.org/x/sys/unix"
 )
 
@@ -41,7 +40,7 @@ const (
 )
 
 // CopyRegularToFile copies the content of a file to another
-func CopyRegularToFile(srcPath string, dstFile *os.File, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error { // nolint: golint
+func CopyRegularToFile(srcPath string, dstFile *os.File, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error { // nolint: revive,golint
 	srcFile, err := os.Open(srcPath)
 	if err != nil {
 		return err
@@ -49,13 +48,13 @@ func CopyRegularToFile(srcPath string, dstFile *os.File, fileinfo os.FileInfo, c
 	defer srcFile.Close()
 
 	if *copyWithFileClone {
-		_, _, err = unix.Syscall(unix.SYS_IOCTL, dstFile.Fd(), C.FICLONE, srcFile.Fd())
-		if err == nil {
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, dstFile.Fd(), C.FICLONE, srcFile.Fd())
+		if errno == 0 {
 			return nil
 		}
 
 		*copyWithFileClone = false
-		if err == unix.EXDEV {
+		if errno == unix.EXDEV {
 			*copyWithFileRange = false
 		}
 	}
@@ -73,7 +72,7 @@ func CopyRegularToFile(srcPath string, dstFile *os.File, fileinfo os.FileInfo, c
 }
 
 // CopyRegular copies the content of a file to another
-func CopyRegular(srcPath, dstPath string, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error { // nolint: golint
+func CopyRegular(srcPath, dstPath string, fileinfo os.FileInfo, copyWithFileRange, copyWithFileClone *bool) error { // nolint: revive,golint
 	// If the destination file already exists, we shouldn't blow it away
 	dstFile, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fileinfo.Mode())
 	if err != nil {
@@ -154,7 +153,7 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 		dstPath := filepath.Join(dstDir, relPath)
 		stat, ok := f.Sys().(*syscall.Stat_t)
 		if !ok {
-			return fmt.Errorf("Unable to get raw syscall.Stat_t data for %s", srcPath)
+			return fmt.Errorf("unable to get raw syscall.Stat_t data for %s", srcPath)
 		}
 
 		isHardlink := false
@@ -199,14 +198,12 @@ func DirCopy(srcDir, dstDir string, copyMode Mode, copyXattrs bool) error {
 			}
 
 		case mode&os.ModeSocket != 0:
-			s, err := net.Listen("unix", dstPath)
-			if err != nil {
+			if err := unix.Mknod(dstPath, stat.Mode, int(stat.Rdev)); err != nil {
 				return err
 			}
-			s.Close()
 
 		case mode&os.ModeDevice != 0:
-			if rsystem.RunningInUserNS() {
+			if unshare.IsRootless() {
 				// cannot create a device if running in user namespace
 				return nil
 			}
