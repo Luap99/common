@@ -1,4 +1,4 @@
-// +build linux,cgo
+//go:build linux
 
 package loopback
 
@@ -13,7 +13,7 @@ import (
 func getLoopbackBackingFile(file *os.File) (uint64, uint64, error) {
 	loopInfo, err := ioctlLoopGetStatus64(file.Fd())
 	if err != nil {
-		logrus.Errorf("Error get loopback backing file: %s", err)
+		logrus.Errorf("Get loopback backing file: %v", err)
 		return 0, 0, ErrGetLoopbackBackingFile
 	}
 	return loopInfo.loDevice, loopInfo.loInode, nil
@@ -22,7 +22,7 @@ func getLoopbackBackingFile(file *os.File) (uint64, uint64, error) {
 // SetCapacity reloads the size for the loopback device.
 func SetCapacity(file *os.File) error {
 	if err := ioctlLoopSetCapacity(file.Fd(), 0); err != nil {
-		logrus.Errorf("Error loopbackSetCapacity: %s", err)
+		logrus.Errorf("loopbackSetCapacity: %s", err)
 		return ErrSetCapacity
 	}
 	return nil
@@ -36,7 +36,7 @@ func FindLoopDeviceFor(file *os.File) *os.File {
 		return nil
 	}
 	targetInode := stat.Sys().(*syscall.Stat_t).Ino
-	targetDevice := stat.Sys().(*syscall.Stat_t).Dev
+	targetDevice := uint64(stat.Sys().(*syscall.Stat_t).Dev) //nolint:unconvert
 
 	for i := 0; true; i++ {
 		path := fmt.Sprintf("/dev/loop%d", i)
@@ -53,7 +53,7 @@ func FindLoopDeviceFor(file *os.File) *os.File {
 		}
 
 		dev, inode, err := getLoopbackBackingFile(file)
-		if err == nil && dev == uint64(targetDevice) && inode == targetInode {
+		if err == nil && dev == targetDevice && inode == targetInode {
 			return file
 		}
 		file.Close()
