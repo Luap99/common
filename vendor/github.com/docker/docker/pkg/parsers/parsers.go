@@ -1,7 +1,7 @@
 // Package parsers provides helper functions to parse and validate different type
 // of string. It can be hosts, unix addresses, tcp addresses, filters, kernel
 // operating system versions.
-package parsers // import "github.com/docker/docker/pkg/parsers"
+package parsers
 
 import (
 	"fmt"
@@ -9,13 +9,16 @@ import (
 	"strings"
 )
 
-// ParseKeyValueOpt parses and validates the specified string as a key/value pair (key=value)
-func ParseKeyValueOpt(opt string) (string, string, error) {
-	parts := strings.SplitN(opt, "=", 2)
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("Unable to parse key/value option: %s", opt)
+// ParseKeyValueOpt parses and validates the specified string as a key/value
+// pair (key=value).
+//
+// Deprecated: use [strings.Cut] instead. This utility was only used internally, and will be removed in the next release.
+func ParseKeyValueOpt(opt string) (key string, value string, _ error) {
+	k, v, ok := strings.Cut(opt, "=")
+	if !ok {
+		return "", "", fmt.Errorf("unable to parse key/value option: %s", opt)
 	}
-	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), nil
+	return strings.TrimSpace(k), strings.TrimSpace(v), nil
 }
 
 // ParseUintListMaximum parses and validates the specified string as the value
@@ -25,13 +28,16 @@ func ParseKeyValueOpt(opt string) (string, string, error) {
 // set to `true`. Values larger than `maximum` cause an error if max is non zero,
 // in order to stop the map becoming excessively large.
 // Supported formats:
-//     7
-//     1-6
-//     0,3-4,7,8-10
-//     0-0,0,1-7
-//     03,1-3      <- this is gonna get parsed as [1,2,3]
-//     3,2,1
-//     0-2,3,1
+//
+//	7
+//	1-6
+//	0,3-4,7,8-10
+//	0-0,0,1-7
+//	03,1-3      <- this is gonna get parsed as [1,2,3]
+//	3,2,1
+//	0-2,3,1
+//
+// Deprecated: ParseUintListMaximum was only used internally and will be removed in the next release.
 func ParseUintListMaximum(val string, maximum int) (map[int]bool, error) {
 	return parseUintList(val, maximum)
 }
@@ -42,13 +48,16 @@ func ParseUintListMaximum(val string, maximum int) (map[int]bool, error) {
 // input string. It returns a `map[int]bool` with available elements from `val`
 // set to `true`.
 // Supported formats:
-//     7
-//     1-6
-//     0,3-4,7,8-10
-//     0-0,0,1-7
-//     03,1-3      <- this is gonna get parsed as [1,2,3]
-//     3,2,1
-//     0-2,3,1
+//
+//	7
+//	1-6
+//	0,3-4,7,8-10
+//	0-0,0,1-7
+//	03,1-3      <- this is gonna get parsed as [1,2,3]
+//	3,2,1
+//	0-2,3,1
+//
+// Deprecated: ParseUintList was only used internally and will be removed in the next release.
 func ParseUintList(val string) (map[int]bool, error) {
 	return parseUintList(val, 0)
 }
@@ -73,22 +82,22 @@ func parseUintList(val string, maximum int) (map[int]bool, error) {
 			}
 			availableInts[v] = true
 		} else {
-			split := strings.SplitN(r, "-", 2)
-			min, err := strconv.Atoi(split[0])
+			minS, maxS, _ := strings.Cut(r, "-")
+			minAvailable, err := strconv.Atoi(minS)
 			if err != nil {
 				return nil, errInvalidFormat
 			}
-			max, err := strconv.Atoi(split[1])
+			maxAvailable, err := strconv.Atoi(maxS)
 			if err != nil {
 				return nil, errInvalidFormat
 			}
-			if max < min {
+			if maxAvailable < minAvailable {
 				return nil, errInvalidFormat
 			}
-			if maximum != 0 && max > maximum {
+			if maximum != 0 && maxAvailable > maximum {
 				return nil, fmt.Errorf("value of out range, maximum is %d", maximum)
 			}
-			for i := min; i <= max; i++ {
+			for i := minAvailable; i <= maxAvailable; i++ {
 				availableInts[i] = true
 			}
 		}
