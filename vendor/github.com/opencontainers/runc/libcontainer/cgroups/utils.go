@@ -1,5 +1,3 @@
-// +build linux
-
 package cgroups
 
 import (
@@ -7,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,8 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencontainers/runc/libcontainer/cgroups/fscommon"
-	"github.com/opencontainers/runc/libcontainer/userns"
+	"github.com/moby/sys/userns"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -24,11 +20,14 @@ import (
 const (
 	CgroupProcesses   = "cgroup.procs"
 	unifiedMountpoint = "/sys/fs/cgroup"
+	hybridMountpoint  = "/sys/fs/cgroup/unified"
 )
 
 var (
 	isUnifiedOnce sync.Once
 	isUnified     bool
+	isHybridOnce  sync.Once
+	isHybrid      bool
 )
 
 // IsCgroup2UnifiedMode returns whether we are running in cgroup v2 unified mode.
@@ -37,17 +36,35 @@ func IsCgroup2UnifiedMode() bool {
 		var st unix.Statfs_t
 		err := unix.Statfs(unifiedMountpoint, &st)
 		if err != nil {
+			level := logrus.WarnLevel
 			if os.IsNotExist(err) && userns.RunningInUserNS() {
-				// ignore the "not found" error if running in userns
-				logrus.WithError(err).Debugf("%s missing, assuming cgroup v1", unifiedMountpoint)
-				isUnified = false
-				return
+				// For rootless containers, sweep it under the rug.
+				level = logrus.DebugLevel
 			}
-			panic(fmt.Sprintf("cannot statfs cgroup root: %s", err))
+			logrus.StandardLogger().Logf(level,
+				"statfs %s: %v; assuming cgroup v1", unifiedMountpoint, err)
 		}
 		isUnified = st.Type == unix.CGROUP2_SUPER_MAGIC
 	})
 	return isUnified
+}
+
+// IsCgroup2HybridMode returns whether we are running in cgroup v2 hybrid mode.
+func IsCgroup2HybridMode() bool {
+	isHybridOnce.Do(func() {
+		var st unix.Statfs_t
+		err := unix.Statfs(hybridMountpoint, &st)
+		if err != nil {
+			isHybrid = false
+			if !os.IsNotExist(err) {
+				// Report unexpected errors.
+				logrus.WithError(err).Debugf("statfs(%q) failed", hybridMountpoint)
+			}
+			return
+		}
+		isHybrid = st.Type == unix.CGROUP2_SUPER_MAGIC
+	})
+	return isHybrid
 }
 
 type Mount struct {
@@ -88,7 +105,7 @@ func GetAllSubsystems() ([]string, error) {
 		// - freezer: implemented in kernel 5.2
 		// We assume these are always available, as it is hard to detect availability.
 		pseudo := []string{"devices", "freezer"}
-		data, err := fscommon.ReadFile("/sys/fs/cgroup", "cgroup.controllers")
+		data, err := ReadFile("/sys/fs/cgroup", "cgroup.controllers")
 		if err != nil {
 			return nil, err
 		}
@@ -119,18 +136,18 @@ func GetAllSubsystems() ([]string, error) {
 	return subsystems, nil
 }
 
-func readProcsFile(file string) ([]int, error) {
-	f, err := os.Open(file)
+func readProcsFile(dir string) (out []int, _ error) {
+	file := CgroupProcesses
+	retry := true
+
+again:
+	f, err := OpenFile(dir, file, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var (
-		s   = bufio.NewScanner(f)
-		out = []int{}
-	)
-
+	s := bufio.NewScanner(f)
 	for s.Scan() {
 		if t := s.Text(); t != "" {
 			pid, err := strconv.Atoi(t)
@@ -140,13 +157,22 @@ func readProcsFile(file string) ([]int, error) {
 			out = append(out, pid)
 		}
 	}
+	if errors.Is(s.Err(), unix.ENOTSUP) && retry {
+		// For a threaded cgroup, read returns ENOTSUP, and we should
+		// read from cgroup.threads instead.
+		file = "cgroup.threads"
+		retry = false
+		goto again
+	}
 	return out, s.Err()
 }
 
 // ParseCgroupFile parses the given cgroup file, typically /proc/self/cgroup
 // or /proc/<pid>/cgroup, into a map of subsystems to cgroup paths, e.g.
-//   "cpu": "/user.slice/user-1000.slice"
-//   "pids": "/user.slice/user-1000.slice"
+//
+//	"cpu": "/user.slice/user-1000.slice"
+//	"pids": "/user.slice/user-1000.slice"
+//
 // etc.
 //
 // Note that for cgroup v2 unified hierarchy, there are no per-controller
@@ -198,21 +224,26 @@ func PathExists(path string) bool {
 	return true
 }
 
-func EnterPid(cgroupPaths map[string]string, pid int) error {
-	for _, path := range cgroupPaths {
-		if PathExists(path) {
-			if err := WriteCgroupProc(path, pid); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
+// rmdir tries to remove a directory, optionally retrying on EBUSY.
+func rmdir(path string, retry bool) error {
+	delay := time.Millisecond
+	tries := 10
 
-func rmdir(path string) error {
+again:
 	err := unix.Rmdir(path)
-	if err == nil || err == unix.ENOENT {
+	switch err { // nolint:errorlint // unix errors are bare
+	case nil, unix.ENOENT:
 		return nil
+	case unix.EINTR:
+		goto again
+	case unix.EBUSY:
+		if retry && tries > 0 {
+			time.Sleep(delay)
+			delay *= 2
+			tries--
+			goto again
+
+		}
 	}
 	return &os.PathError{Op: "rmdir", Path: path, Err: err}
 }
@@ -220,106 +251,110 @@ func rmdir(path string) error {
 // RemovePath aims to remove cgroup path. It does so recursively,
 // by removing any subdirectories (sub-cgroups) first.
 func RemovePath(path string) error {
-	// try the fast path first
-	if err := rmdir(path); err == nil {
+	// Try the fast path first; don't retry on EBUSY yet.
+	if err := rmdir(path, false); err == nil {
 		return nil
 	}
 
-	infos, err := ioutil.ReadDir(path)
+	// There are many reasons why rmdir can fail, including:
+	// 1. cgroup have existing sub-cgroups;
+	// 2. cgroup (still) have some processes (that are about to vanish);
+	// 3. lack of permission (one example is read-only /sys/fs/cgroup mount,
+	//    in which case rmdir returns EROFS even for for a non-existent path,
+	//    see issue 4518).
+	//
+	// Using os.ReadDir here kills two birds with one stone: check if
+	// the directory exists (handling scenario 3 above), and use
+	// directory contents to remove sub-cgroups (handling scenario 1).
+	infos, err := os.ReadDir(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			err = nil
+			return nil
 		}
 		return err
 	}
+	// Let's remove sub-cgroups, if any.
 	for _, info := range infos {
 		if info.IsDir() {
-			// We should remove subcgroups dir first
 			if err = RemovePath(filepath.Join(path, info.Name())); err != nil {
-				break
+				return err
 			}
 		}
 	}
-	if err == nil {
-		err = rmdir(path)
-	}
-	return err
+	// Finally, try rmdir again, this time with retries on EBUSY,
+	// which may help with scenario 2 above.
+	return rmdir(path, true)
 }
 
 // RemovePaths iterates over the provided paths removing them.
-// We trying to remove all paths five times with increasing delay between tries.
-// If after all there are not removed cgroups - appropriate error will be
-// returned.
 func RemovePaths(paths map[string]string) (err error) {
-	const retries = 5
-	delay := 10 * time.Millisecond
-	for i := 0; i < retries; i++ {
-		if i != 0 {
-			time.Sleep(delay)
-			delay *= 2
+	for s, p := range paths {
+		if err := RemovePath(p); err == nil {
+			delete(paths, s)
 		}
-		for s, p := range paths {
-			if err := RemovePath(p); err != nil {
-				// do not log intermediate iterations
-				switch i {
-				case 0:
-					logrus.WithError(err).Warnf("Failed to remove cgroup (will retry)")
-				case retries - 1:
-					logrus.WithError(err).Error("Failed to remove cgroup")
-				}
-
-			}
-			_, err := os.Stat(p)
-			// We need this strange way of checking cgroups existence because
-			// RemoveAll almost always returns error, even on already removed
-			// cgroups
-			if os.IsNotExist(err) {
-				delete(paths, s)
-			}
-		}
-		if len(paths) == 0 {
-			//nolint:ineffassign,staticcheck // done to help garbage collecting: opencontainers/runc#2506
-			paths = make(map[string]string)
-			return nil
-		}
+	}
+	if len(paths) == 0 {
+		clear(paths)
+		return nil
 	}
 	return fmt.Errorf("Failed to remove paths: %v", paths)
 }
 
-func GetHugePageSize() ([]string, error) {
-	dir, err := os.OpenFile("/sys/kernel/mm/hugepages", unix.O_DIRECTORY|unix.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-	files, err := dir.Readdirnames(0)
-	dir.Close()
-	if err != nil {
-		return nil, err
-	}
+var (
+	hugePageSizes []string
+	initHPSOnce   sync.Once
+)
 
-	return getHugePageSizeFromFilenames(files)
+func HugePageSizes() []string {
+	initHPSOnce.Do(func() {
+		dir, err := os.OpenFile("/sys/kernel/mm/hugepages", unix.O_DIRECTORY|unix.O_RDONLY, 0)
+		if err != nil {
+			return
+		}
+		files, err := dir.Readdirnames(0)
+		dir.Close()
+		if err != nil {
+			return
+		}
+
+		hugePageSizes, err = getHugePageSizeFromFilenames(files)
+		if err != nil {
+			logrus.Warn("HugePageSizes: ", err)
+		}
+	})
+
+	return hugePageSizes
 }
 
 func getHugePageSizeFromFilenames(fileNames []string) ([]string, error) {
 	pageSizes := make([]string, 0, len(fileNames))
+	var warn error
 
 	for _, file := range fileNames {
 		// example: hugepages-1048576kB
 		val := strings.TrimPrefix(file, "hugepages-")
 		if len(val) == len(file) {
-			// unexpected file name: no prefix found
+			// Unexpected file name: no prefix found, ignore it.
 			continue
 		}
-		// The suffix is always "kB" (as of Linux 5.9)
+		// The suffix is always "kB" (as of Linux 5.13). If we find
+		// something else, produce an error but keep going.
 		eLen := len(val) - 2
 		val = strings.TrimSuffix(val, "kB")
 		if len(val) != eLen {
-			logrus.Warnf("GetHugePageSize: %s: invalid filename suffix (expected \"kB\")", file)
+			// Highly unlikely.
+			if warn == nil {
+				warn = errors.New(file + `: invalid suffix (expected "kB")`)
+			}
 			continue
 		}
 		size, err := strconv.Atoi(val)
 		if err != nil {
-			return nil, err
+			// Highly unlikely.
+			if warn == nil {
+				warn = fmt.Errorf("%s: %w", file, err)
+			}
+			continue
 		}
 		// Model after https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/hugetlb_cgroup.c?id=eff48ddeab782e35e58ccc8853f7386bbae9dec4#n574
 		// but in our case the size is in KB already.
@@ -333,34 +368,12 @@ func getHugePageSizeFromFilenames(fileNames []string) ([]string, error) {
 		pageSizes = append(pageSizes, val)
 	}
 
-	return pageSizes, nil
+	return pageSizes, warn
 }
 
 // GetPids returns all pids, that were added to cgroup at path.
 func GetPids(dir string) ([]int, error) {
-	return readProcsFile(filepath.Join(dir, CgroupProcesses))
-}
-
-// GetAllPids returns all pids, that were added to cgroup at path and to all its
-// subcgroups.
-func GetAllPids(path string) ([]int, error) {
-	var pids []int
-	// collect pids from all sub-cgroups
-	err := filepath.Walk(path, func(p string, info os.FileInfo, iErr error) error {
-		if iErr != nil {
-			return iErr
-		}
-		if info.IsDir() || info.Name() != CgroupProcesses {
-			return nil
-		}
-		cPids, err := readProcsFile(p)
-		if err != nil {
-			return err
-		}
-		pids = append(pids, cPids...)
-		return nil
-	})
-	return pids, err
+	return readProcsFile(dir)
 }
 
 // WriteCgroupProc writes the specified pid into the cgroup's cgroup.procs file
@@ -376,9 +389,9 @@ func WriteCgroupProc(dir string, pid int) error {
 		return nil
 	}
 
-	file, err := fscommon.OpenFile(dir, CgroupProcesses, os.O_WRONLY)
+	file, err := OpenFile(dir, CgroupProcesses, os.O_WRONLY)
 	if err != nil {
-		return fmt.Errorf("failed to write %v to %v: %v", pid, CgroupProcesses, err)
+		return fmt.Errorf("failed to write %v: %w", pid, err)
 	}
 	defer file.Close()
 
@@ -395,7 +408,7 @@ func WriteCgroupProc(dir string, pid int) error {
 			continue
 		}
 
-		return fmt.Errorf("failed to write %v to %v: %v", pid, CgroupProcesses, err)
+		return fmt.Errorf("failed to write %v: %w", pid, err)
 	}
 	return err
 }
@@ -414,26 +427,29 @@ func ConvertCPUSharesToCgroupV2Value(cpuShares uint64) uint64 {
 
 // ConvertMemorySwapToCgroupV2Value converts MemorySwap value from OCI spec
 // for use by cgroup v2 drivers. A conversion is needed since Resources.MemorySwap
-// is defined as memory+swap combined, while in cgroup v2 swap is a separate value.
+// is defined as memory+swap combined, while in cgroup v2 swap is a separate value,
+// so we need to subtract memory from it where it makes sense.
 func ConvertMemorySwapToCgroupV2Value(memorySwap, memory int64) (int64, error) {
-	// for compatibility with cgroup1 controller, set swap to unlimited in
-	// case the memory is set to unlimited, and swap is not explicitly set,
-	// treating the request as "set both memory and swap to unlimited".
-	if memory == -1 && memorySwap == 0 {
+	switch {
+	case memory == -1 && memorySwap == 0:
+		// For compatibility with cgroup1 controller, set swap to unlimited in
+		// case the memory is set to unlimited and the swap is not explicitly set,
+		// treating the request as "set both memory and swap to unlimited".
 		return -1, nil
-	}
-	if memorySwap == -1 || memorySwap == 0 {
-		// -1 is "max", 0 is "unset", so treat as is
+	case memorySwap == -1, memorySwap == 0:
+		// Treat -1 ("max") and 0 ("unset") swap as is.
 		return memorySwap, nil
-	}
-	// sanity checks
-	if memory == 0 || memory == -1 {
+	case memory == -1:
+		// Unlimited memory, so treat swap as is.
+		return memorySwap, nil
+	case memory == 0:
+		// Unset or unknown memory, can't calculate swap.
 		return 0, errors.New("unable to set swap limit without memory limit")
-	}
-	if memory < 0 {
+	case memory < 0:
+		// Does not make sense to subtract a negative value.
 		return 0, fmt.Errorf("invalid memory value: %d", memory)
-	}
-	if memorySwap < memory {
+	case memorySwap < memory:
+		// Sanity check.
 		return 0, errors.New("memory+swap limit should be >= memory limit")
 	}
 
@@ -448,5 +464,5 @@ func ConvertBlkIOToIOWeightValue(blkIoWeight uint16) uint64 {
 	if blkIoWeight == 0 {
 		return 0
 	}
-	return uint64(1 + (uint64(blkIoWeight)-10)*9999/990)
+	return 1 + (uint64(blkIoWeight)-10)*9999/990
 }
